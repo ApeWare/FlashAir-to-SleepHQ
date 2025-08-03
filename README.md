@@ -58,8 +58,11 @@ Timing and Order:
 - Cycle repeats every 30 min; no user input needed after setup.
 
 # Directory Structure
+```
 ~/Library/LaunchAgents/com.user.pollflashair.plist
 ~/Documents/ResMed Automation/poll_flashair.sh
 ~/Documents/ResMed Automation/sync.sh
 ~/Dropbox/ResMed CPAP Data
-* Dropbox is not required, you can store your sleep data wherever you wish.
+* Dropbox is not required; you can store your sleep data wherever you wish.
+```
+
