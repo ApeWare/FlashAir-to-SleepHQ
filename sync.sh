@@ -1,0 +1,1712 @@
+#! /bin/bash
+# VERSION=1
+#
+# Modified from original at https://github.com/iitggithub/ezshare_cpap (MIT License)
+#
+# Change log:
+#
+# - Converted from EZShare to work with Toshiba FlashAir Wifi SSD card
+#
+# Script to sync data from an FlashAir WiFi SD card to a folder on your mac
+
+##################
+# GLOBAL VARIABLES
+##################
+os="$(uname)"
+case "${os}" in
+  Linux)
+    sdCardDir="${HOME}/SD_Card" # The location where SD card files will be synchronised
+    flashAirConfigDir="${HOME}/.flashair" # Configuration files are stored here
+    ;;
+  *)
+    sdCardDir="/Users/$(whoami)/Desktop/SD_Card" # The location where SD card files will be synchronised
+    ;;
+esac
+
+uploadZipFileName="upload.zip" 							# The name of the zip file which will be uploaded to Sleep HQ
+uploadZipFile="${sdCardDir}/${uploadZipFileName}" 		# The absolute path to the Zip file containing files needing to be uploaded
+lastRunFile="${sdCardDir}/.sync_last_run_time"			# stores the last time the script was executed. DO NOT CHANGE THE NAME OF THIS FILE WITHOUT UPDATING findFilesInDir
+lockfile="${sdCardDir}/.sync.sh.lock" 					# A temporary file used to make sure only one instance of the script can be executed at a time
+me="$(echo "${0}" | sed -e 's|^./||')" 					# The script name but without the ./ if it has one. Otherwise use ${0}
+dirList=("/") 											# contains a list of remote directories that need to be checked on the SD Card ie: / etc
+flashAirURL="http://192.168.1.50/" 						# The base URL path to be prepended to each URL on the SD card
+maxParallelDirChecks=15 								# The number of directories to check in parallel new/changed files
+maxParallelDownloads=5 									# The number of files to download from the SD card at the same time
+fastsyncEnabled=true 									# Controls whether or not to use .html files to speed up directory searching
+flashAirSyncInProgress=0 								# Added to allow the removal of partially sync'd directories
+sleepHQuploadsEnabled=false 							# Determines whether to upload data to Sleep HQ.
+sleepHQAPIBaseURL="https://sleephq.com" 				# The base URL for the Sleep HQ API
+sleepDataSyncEnabled=true 								# Pulls data from SD Card and optionally pushes it to Sleep HQ
+o2RingSyncEnabled=true 									# Scans the ${sdCardDir} for O2 Ring CSV export files and uploads them to Sleep HQ
+o2RingDeviceID="69184" 									# The device ID for the O2 ring. This is hard coded on the server and shouldn't change.
+
+# Colors!
+red="\033[31m"
+green="\033[32m"
+reset="\033[0m"
+
+################################
+## SYNC.SH SPECIFIC FUNCTIONS ##
+################################
+
+# Uses output from the security command to provide
+# more context as to the result of actions against
+# keys in the users keychain.
+verifyKeychainAction() {
+  local action="${1}" 	# ie delete, add or verify
+  local key="${2}" 		# The name of the key ie FlashAirWifiSSID
+  local retVal="${3}" 	# The return value of the 
+  local output="${4}"
+
+  if [ "${retVal}" -eq 0 ]; then
+    echo -e "${green}Successfully performed ${action} against key ${key} in your keychain.${reset}"
+  else
+    echo
+    echo -e "${red}Failed to perform ${action} against key ${key} in your keychain.${reset}"
+    echo "Error Code: ${retVal}"
+    echo "Error Info: ${output}"
+  fi
+}
+
+# Function that blocks script
+# execution until internet
+# connectivity has been restored.
+waitForConnectivity() {
+  local target="${1}"
+  local output
+  local attempts="5"
+
+  if [ "${numWifiAdaptors}" -gt 1 ]; then
+    attempts="15" # Keep trying... more
+  fi
+  
+  for ((i=1;i<=${attempts};i++)); do
+    if curl -ks --connect-timeout 5 --max-time 60 -I "${target}" | grep "^HTTP/" | awk '{print $2}' | egrep "200|302|301" >/dev/null; then
+      return 0
+    fi
+    sleep 1
+  done
+
+  echo -e "${red} FAILED!${reset}\n\nFailed connectivity check to ${target}."
+  echo "Please check network connectivity."
+  echo
+  echo "Cannot continue... exiting..."
+  exit 1
+}
+
+# Connects to a given wifi network
+connectToWifiNetwork() {
+  local wifiAdaptor="${1}"
+  local ssid="${2}"
+  local password="${3}"
+  local attempt=0
+  local waitTime=10
+  local os="$(uname)"
+  local connected
+
+  while (( attempt < 5 )); do
+    echo -n "Connecting to Wi-Fi '${ssid}' on ${wifiAdaptor}... "
+    connected=false
+
+    case "${os}" in
+      Darwin)
+        if networksetup -setairportnetwork "${wifiAdaptor}" "${ssid}" "${password}" &>/dev/null; then
+          connected=true
+        fi
+        ;;
+      Linux)
+        sudo nmcli device wifi rescan ifname "${wifiAdaptor}" >/dev/null 2>&1 # Refresh the wifi SSID list before we attempt to connect
+        if sudo nmcli device wifi connect "${ssid}" password "${password}" ifname "${wifiAdaptor}" &>/dev/null; then
+          connected=true
+        fi
+        ;;
+      *)
+        echo -e "${red}Unsupported OS: ${os}.${reset}"
+        exit 1
+        ;;
+    esac
+
+    if ${connected}; then
+      echo -e "${green}DONE!${reset}"
+      return 0
+    fi
+
+    echo -e "\n\n${red}Failed to connect to Wi-Fi '${ssid}'.${reset}\n"
+    echo -n "Retrying in ${waitTime}s (Ctrl+C to abort)"
+    for (( i=0; i<${waitTime}; i++ )); do
+      echo -n "."
+      sleep 1
+    done
+    echo -e "\n\n"
+    (( attempt++ ))
+  done
+
+  echo -e "\n\n${red}Unable to connect to Wi-Fi '${ssid}' after ${attempt} attempts.${reset}"
+  return 1
+}
+
+
+# Exit function which makes sure we clean up
+# after ourselves and reconnect to the home WiFi
+# if we're not already connected to it.
+exitFunction() {
+  if [ "${flashAirSyncInProgress}" -eq 1 ]; then
+    echo -e "Something went wrong with the sync. Rolling back changes in the DATALOG directory...\n"
+
+    wait # wait for any transfers to complete
+    if [ -f "${transferListFile}" ]; then
+      while IFS= read -r line || [[ -n "${line}" ]]; do
+        (
+          path=$(echo "${line}" | cut -f2 -d ';')
+          # Remove the file if it's in the DATALOG directory
+          if [ -f "${path}" ] && echo "${path}" | grep -q "DATALOG"; then
+            rm -vf "${path}"
+          fi
+        ) &
+
+        # Limit the number of parallel jobs
+        if [[ $(jobs -r -p | wc -l) -ge "${maxParallelDownloads}" ]]; then
+          wait
+        fi
+      done < "${transferListFile}"
+      
+      # find and remove any empty directories in the DATALOG directory as well
+      find "${sdCardDir}/DATALOG" -mindepth 1 -maxdepth 1 -type d -empty -exec rmdir "{}" \;
+    fi
+    echo -e "\nCleanup complete"
+  fi
+
+  if [ "${numWifiAdaptors}" -eq 1 ]; then
+    if [[ "${flashAirConnected}" -eq 1 ]]; then
+      connectToWifiNetwork "${wifiAdaptor}" "${homeWiFiSSID}" "${homeWiFiPassword}"
+    fi
+  fi
+
+  # If we have a sleep HQ Team ID, tell the user to delete it
+  if [ -n "${sleepHQImportTaskID}" ]; then
+    echo "sleepHQImportTaskID is currently set to ${sleepHQImportTaskID}."
+    echo "Please make sure to visit the Data Imports section of the Sleep HQ"
+    echo "website to delete the import because this script is not scoped for"
+    echo "DELETE operations intentionally."
+  fi
+
+  # Remove the lock file if it exists
+  if [ -f "${lockfile}" ]; then
+    rm -f "${lockfile}"
+  fi
+
+  trap - INT TERM EXIT
+  exit
+}
+
+# Automatically updates the script to the latest version
+# to make it easier for those who need it
+# versionCheck() {
+#   local me="${1}"
+#   local args="${2}"
+#   local lv
+#   local cv
+
+#   lv=$(curl --connect-timeout 20 --max-time 300 -ks -o - https://raw.githubusercontent.com/ApeWare/FlashAir-to-SleepHQ/main/sync.sh 2>/dev/null | grep "^# VERSION=" | cut -f2 -d '=')
+#   cv=$(grep "^# VERSION=" "${me}" 2>/dev/null | cut -f2 -d '=')
+
+#   if [ -z "${lv}" ]; then
+#     lv=0 # something went wrong fetching latest version. Default to no update.
+#   fi
+
+#   if [ -z "${cv}" ]; then
+#     cv=0 # this version of the script doesn't have version checking enabled. Try to force an update.
+#   fi
+
+#   if [ "${lv}" -gt "${cv}" ]; then
+#     echo "Script update available. Auto-update from version ${cv} to ${lv} in progress..."
+#     curl --connect-timeout 20 --max-time 300 -k -o "${me}" https://raw.githubusercontent.com/ApeWare/FlashAir-to-SleepHQ/main/sync.sh
+#     echo -e "${green}Done${reset}. Relaunching using ${me} ${args}"
+#     bash "${me}" "${args}"
+#     exit
+#   fi
+# }
+
+# A failsafe function which is used to search the DATALOG
+# directory for signs of last time the script was run. 
+# if this fails, it'll sync everything as the last time
+# is automatically set to the epoch.
+getLastRunDate() {
+  local dataDir="${1}"
+  local latestFile
+  local timestamp
+
+  # this is a brand new sync since nothing exists
+  if [ ! -d "${dataDir}" ]; then
+    echo 0 # sync everything on the SD card
+    return 0
+  fi
+  
+  case "${os}" in
+    Darwin)
+      # Changed to use cut -f2- -d " " to allow for paths that contain a space
+      latestFile=$(find "${dataDir}" -mindepth 2 -type f ! -name ".DS_Store" -exec stat -f "%m %N" "{}" + 2>/dev/null | sort -nr 2>/dev/null | head -n 1 | cut -f2- -d " ")
+      test -z "${latestFile}" && echo 0 && return 0 # DATALOG directory exists but there's no files. This is also a brand new sync.
+
+      # Get the last modified date
+      timestamp=$(stat -f "%Sm" -t "%Y-%m-%d %H:%M:%S" "${latestFile}")
+
+      # Convert the last modified date to seconds
+      date -j -f "%Y-%m-%d %H:%M:%S" "${timestamp}" +"%s"
+    ;;
+    Linux)
+      # Changed to use cut -f2- -d " " to allow for paths that contain a space
+      latestFile=$(find "${dataDir}" -mindepth 2 -type f ! -name '.DS_Store' -printf '%T@ %p\n' 2>/dev/null | sort -nr 2>/dev/null | head -n 1 | cut -f2- -d " ")
+      test -z "${latestFile}" && echo 0 && return 0 # DATALOG directory exists but there's no files. This is also a brand new sync.
+
+      # Return the last modified date in seconds
+      stat -c "%Y" "${latestFile}"
+    ;;
+  esac
+}
+
+# Stores date in seconds in the lastRunFile
+# The number corresponds to the last time
+# the script successfully synchronized files
+# from the SD card 
+storeLastRunTimestamp() {
+  local timestamp="${1}"
+  shift
+  local lastRunFile="${@}"
+  echo "${timestamp}" >"${lastRunFile}"
+}
+
+# finds the date in seconds of the last time the script was run
+# If the file doesn't exist, it will try to use files in the DATALOG
+# directory to determine the last time files were sync'd and if all
+# else fails, it'll sync everything as the last time is automatically
+# set to the epoch.
+getLastRunTimestamp() {
+  local file="${1}"
+  local dataDir="${2}"
+
+  # Either this is the first time the script has been run
+  # or the file doesn't exist which holds the last run time
+  if [ ! -f "${file}" ]; then
+    # Use the getLastRunDate function to search the DATALOG
+    # directory for signs of last time the script was run. 
+    getLastRunDate "${dataDir}"
+    return 0 # return so we don't continue with the function
+  fi
+
+  lastRunDateInSeconds=$(head -1 "${file}" | awk '{print $1}')
+  if ! [[ "${lastRunDateInSeconds}" =~ ^[0-9]+$ ]]; then
+    # Not sure what's going on but that's not a number
+    # Use the getLastRunDate function to search the DATALOG
+    # directory for signs of last time the script was run. 
+    lastRunDateInSeconds=$(getLastRunDate "${dataDir}")
+  fi
+  echo "${lastRunDateInSeconds}"
+}
+
+###############################
+## FLASHAIR SD SYNC FUNCTIONS ##
+###############################
+
+# Checks if the remote files size has changed compared to the local file
+# returns true if it has changed. false if it hasn't
+fileSizeHasChanged() {
+  local size="${1}"
+  local file="${2}"
+  local localFileSizeInBytes
+  local os
+
+  os="$(uname)"
+
+  # get file size in bytes (OS‐specific)
+  case "${os}" in
+    Darwin)
+      localFileSizeInBytes=$(stat -f%z "${file}")
+    ;;
+    Linux)
+      localFileSizeInBytes=$(stat -c%s "${file}")
+    ;;
+  esac
+
+  # if the number is divisible by 1024, do not round number up
+  # else, round the number up to the nearest kilobyte
+  # seems this was needed because the sizes reported by the SD card
+  # aren't accurate.
+  if (( localFileSizeInBytes % 1024 == 0 )); then
+    localFileSizeInKB=$(awk -v size="${localFileSizeInBytes}" 'BEGIN { printf "%.0f", (size / 1024) }')
+  else
+    localFileSizeInKB=$(awk -v size="${localFileSizeInBytes}" 'BEGIN { printf "%.0f", (size / 1024 + 0.5) }')
+  fi
+  
+  if [ "${size}" != "${localFileSizeInKB}" ]; then
+    return 0 # file size is different
+  fi
+  return 1 # return false
+}
+
+getLocalPath() {
+  local type="${1}"
+  local decodedPath="${2}"
+  local name="${3}"
+
+  if [ "${type}" == "dir" ]; then
+    echo "${decodedPath}" | sed 's|//|/|g'
+  else
+    # For FlashAir, direct path, clean and remove leading /
+    echo "${uri}/${name}" | sed 's|//|/|g' | sed 's|^/||'
+  fi
+}
+
+fileTimestampHasChanged() {
+  local lastRunDateInSeconds="${1}"
+  local has="${2}"
+  local time="${3}"
+  if [ -z "${has}" ] || [ -z "${time}" ]; then
+    return 0  # Assume new if timestamp fields empty
+  fi
+  # Parse FlashAir bit-packed time/has
+  year=$(( (time >> 9) + 1980 ))
+  month=$(( (time >> 5) & 15 ))
+  day=$(( time & 31 ))
+  hour=$(( (has >> 11) & 31 ))
+  minute=$(( (has >> 5) & 63 ))
+  second=$(( (has & 31) * 2 ))
+  fileTimestamp="$(printf "%4d-%02d-%02d %02d:%02d:%02d" $year $month $day $hour $minute $second)"
+  # Convert to seconds
+  targetDateInSeconds=$(date -j -f "%Y-%m-%d %H:%M:%S" "${fileTimestamp}" "+%s" 2>/dev/null)
+  if [ -z "${targetDateInSeconds}" ]; then
+    return 0 # Assume new if parsing fails
+  fi
+  if (( lastRunDateInSeconds < targetDateInSeconds )); then
+    return 0
+  fi
+  return 1
+}
+
+# Extract the file size from the line
+# file size is the 3rd column ie 64KB
+# 2024- 6- 7   20:50:24          64KB  <a href="http://192.168.4.1/download?file=JOURNAL.DAT"> Journal.dat</a>
+# and then returns the INT only ie 64
+getRemoteFileSize() {
+  local line="${1}"
+  local remoteFileSize
+  remoteFileSize=$(echo "${line}" | grep -oE ' ([0-9]+)KB ' 2>/dev/null | awk '{$1=$1};1' 2>/dev/null | sed -e 's/KB//' 2>/dev/null)
+  if [ -z "${remoteFileSize}" ]; then
+    echo 0
+  fi
+  echo "${remoteFileSize}"
+}
+
+findRemoteDirs() {
+  local maxParallelDirChecks="${1}"
+  local flashAirURL="${2}"
+  local uri="${3}"
+  local sdCardDir="${4}"
+  local url="${flashAirURL}command.cgi?op=100&DIR=${uri}"  # FlashAir directory list API
+  local csv
+  local name
+  local localPath
+
+  csv=$(curl --connect-timeout 20 --max-time 300 -s "$url" 2>/dev/null)
+  if [ -z "${csv}" ]; then
+    echo "Something went wrong executing the command below:" >>/dev/stderr
+    echo >>/dev/stderr
+    echo "curl --connect-timeout 20 --max-time 300 \"${url}\"" >>/dev/stderr
+    echo >>/dev/stderr
+    echo "Cannot process the url. Skipping..." >>/dev/stderr
+    return
+  fi
+
+  # FlashAir output is CSV like: WLANSDHL,4
+  # /DCIM,0,0,16,0,0
+  # Skip header, loop lines
+  echo "${csv}" | tail -n +2 | while IFS=',' read -r dir name size attr has time; do
+    # Skip if not directory (attr & 16 == 16 for dir)
+    if (( (attr & 16) != 16 )); then
+      continue
+    fi
+
+    # Skip system dirs
+    case "${name}" in
+      "."|".."|".fseventsd"|".Spotlight-V100"|".Trashes")
+        continue
+      ;;
+      *)
+        # Build next URI, clean double slashes
+        link=$(echo "${uri}/${name}" | sed 's|//|/|g')
+        localPath="${link#/}"  # Remove leading / for local path
+
+        # Create the directory if it doesn't exist
+        if [ ! -d "${sdCardDir}/${localPath}" ]; then
+          mkdir -p "${sdCardDir}/${localPath}"
+        fi
+        echo "${link}"
+        findRemoteDirs "${maxParallelDirChecks}" "${flashAirURL}" "${link}" "${sdCardDir}" &
+      ;;
+    esac
+    # Limit parallel jobs
+    if [[ $(jobs -r -p | wc -l) -ge ${maxParallelDirChecks} ]]; then
+      wait
+    fi
+  done
+}
+findFilesInDir() {
+  local flashAirURL="${1}"
+  local uri="${2}"
+  local sdCardDir="${3}"
+  local transferListFile="${4}"
+  local lastRunDateInSeconds="${5}"
+  local fastsyncEnabled="${6}"
+  local url="${flashAirURL}command.cgi?op=100&DIR=${uri}"  # FlashAir directory list API
+  local csv
+  local name
+  local size
+  local attr
+  local has
+  local time
+  local fileSize
+  local localPath
+  local link
+
+  csv=$(curl --connect-timeout 20 --max-time 300 -s "$url" 2>/dev/null)
+  if [ -z "${csv}" ]; then
+    echo "Something went wrong executing the command below:" >>/dev/stderr
+    echo >>/dev/stderr
+    echo "curl --connect-timeout 20 --max-time 300 \"${url}\"" >>/dev/stderr
+    echo >>/dev/stderr
+    echo "Cannot process the url. Skipping..." >>/dev/stderr
+    return
+  fi
+
+  # Skip header, loop CSV lines for non-dirs (files)
+  echo "${csv}" | tail -n +2 | while IFS=',' read -r dir name size attr has time; do
+    # Skip if directory (attr & 16 == 16 for dir)
+    if (( (attr & 16) == 16 )); then
+      continue
+    fi
+
+    # Skip system files
+    case "${name}" in
+      "."|".."|".fseventsd"|".Spotlight-V100"|".DS_Store"|".Trashes"|"_*")
+        continue
+      ;;
+      *)
+        # Build download link (FlashAir download is direct path: http://192.168.1.50/path/to/file)
+        link=$(echo "${uri}/${name}" | sed 's|//|/|g')
+        localPath="${link#/}"  # Remove leading / for local path
+
+        # Get size in KB
+        fileSize=$(( size / 1024 ))
+
+        # Check if new/changed or missing locally
+        if [ ! -f "${sdCardDir}/${localPath}" ] || fileTimestampHasChanged "${lastRunDateInSeconds}" "${has}" "${time}" || fileSizeHasChanged "${fileSize}" "${sdCardDir}/${localPath}"; then
+          # For download, the URL is flashAirURL + link (e.g., http://192.168.1.50/DATALOG/20250802/file.edf)
+          download_url="${flashAirURL}${link}"
+          echo "${download_url};${localPath}" >>"${transferListFile}"
+        fi
+      ;;
+    esac
+  done
+
+  # For fastsync, save CSV as cache
+  if ${fastsyncEnabled}; then
+    echo "${csv}" > "${sdCardDir}/${uri#/}/.dirlist.csv"  # Cache for next run, adjust path
+  fi
+}
+
+# Function to process the file list and download files in parallel
+downloadFiles() {
+  local maxParallelDownloads="${1}"
+  local transferListFile="${2}"
+  local sdCardDir="${3}"
+  # If we've gotten to this point and called the downloadFiles
+  # function. There's probably a bug. The script should only
+  # execute this function if the transferListFile exists.
+  if [ ! -f "${transferListFile}" ]; then
+    echo "No files have been marked for transfer yet"
+    echo "the downloadFiles function has been called."
+    echo "This is almost certainly a bug and needs to be"
+    echo "reported."
+    echo
+    echo "Cannot continue... exiting..."
+    exit 1
+  fi
+  # Process each item in the list
+  while IFS= read -r line || [[ -n "${line}" ]]; do
+    (
+      url=$(echo "${line}" | cut -f1 -d ';')
+      path=$(echo "${line}" | cut -f2 -d ';')
+      echo "Downloading ${url} to ${sdCardDir}/${path}"
+      mkdir -p "$(dirname "${sdCardDir}/${path}")"  # Create parent dirs for the file
+      curl -# --connect-timeout 20 --max-time 300 -o "${sdCardDir}/${path}" "${url}"
+    ) &
+    # Limit the number of parallel jobs
+    if [[ $(jobs -r -p | wc -l) -ge "${maxParallelDownloads}" ]]; then
+      wait
+    fi
+  done < "${transferListFile}"
+  # Wait for all background jobs to finish
+  wait
+}
+
+############################
+## SLEEP HQ ZIP FUNCTIONS ##
+############################
+
+# Creates a zip file of sleep data and CPAP machine files
+# so it can be uploaded to Sleep HQ
+createSleepDataZipFile() {
+  local uploadZipFile="${1}"
+  local sdCardDir
+  local transferListFile="${2}"
+  local fileList=()
+  local mandatoryInclusions=()
+  local startDate
+  local endDate
+  sdCardDir=$(dirname "${uploadZipFile}")
+  mandatoryInclusions=("Identification.crc" "Identification.tgt" "Identification.json" "JOURNAL.JNL" "Journal.dat" "SETTINGS" "STR.edf")
+  # Get dates from transferList if available, else scan all DATALOG
+  startDate=$(cut -f2 -d ';' "${transferListFile}" | grep '^DATALOG/' | cut -f2 -d '/' | grep -oE '[0-9]+' | sort | uniq | head -1)
+  endDate=$(cut -f2 -d ';' "${transferListFile}" | grep '^DATALOG/' | cut -f2 -d '/' | grep -oE '[0-9]+' | sort | uniq | tail -1)
+  if [ -z "${startDate}" ]; then
+    startDate=$(ls -1 "${sdCardDir}/DATALOG" 2>/dev/null | grep -oE '[0-9]+' | sort | uniq | head -1)
+    endDate=$(ls -1 "${sdCardDir}/DATALOG" 2>/dev/null | grep -oE '[0-9]+' | sort | uniq | tail -1)
+  fi
+  echo -e "\nCreating upload.zip file..."
+  # Double check we're in the SD card directory
+  cd "${sdCardDir}"
+  # Remove the existing upload.zip file
+  test -f "${uploadZipFile}" && rm -f "${uploadZipFile}"
+  # Read each line from the input file
+  while IFS= read -r line; do
+    # Extract the local file path using ';' as the delimiter
+    path=$(echo "${line}" | cut -d';' -f2)
+    # Exclude files starting with SETTINGS/ because the whole SETTINGS
+    # directory will be included by default
+    if [[ "${path}" == SETTINGS/* ]]; then
+      continue
+    fi
+    # Append the local file path to the array
+    fileList+=("${path}")
+  done < "${transferListFile}"
+  # Ensure mandatory files are included
+  for inclusion in "${mandatoryInclusions[@]}"; do
+    if [[ ! " ${fileList[@]} " =~ " ${inclusion} " ]]; then
+      # If it's a file or directory, add it to the file list
+      if [ -e "${sdCardDir}/${inclusion}" ]; then
+        fileList+=("${inclusion}")
+      fi
+    fi
+  done
+  # Create a zip archive containing the files with relative paths
+  zip -r "${uploadZipFile}" "${fileList[@]}" --exclude '.*' --exclude 'SETTINGS/.*' --exclude '*DS_Store' --exclude '*.html' --exclude 'DCIM/*'
+  # Don't bother continuing if the zip file hasn't been created.
+  if [ ! -f "${uploadZipFile}" ]; then
+    echo -e " ${red}FAILED!${reset}\n\nFailed to create ${uploadZipFile}."
+    echo "Cannot continue with automatic upload. Please upload your data manually."
+    echo
+    exit 1
+  else
+    echo -e "\n${green}DONE!${reset}\nCreated ${uploadZipFile} which includes dates ${startDate} to ${endDate}."
+  fi
+}
+
+# Creates a zip file consisting of o2 ring csv files
+# for upload to Sleep HQ
+createO2RingDataZipFile() {
+  local uploadZipFile="${1}"
+  local sdCardDir
+
+  sdCardDir=$(dirname "${uploadZipFile}")
+
+  echo -e "\nCreating upload.zip file..."
+
+  # Double check we're in the SD card directory
+  cd "${sdCardDir}"
+
+  # Remove the existing upload.zip file
+  test -f "${uploadZipFile}" && rm -f "${uploadZipFile}"
+
+  # upload zip file has been copied to iCloud. Evict the local copy
+  test -f "${sdCardDir}/.$(basename "${uploadZipFile}").icloud" && brctl evict "${uploadZipFile}"
+
+  # Create a zip archive containing the files with relative paths
+  find "${sdCardDir}" -mindepth 1 -maxdepth 1 -type f -name "O2Ring*.csv" -print0 | xargs -0 -n 1 zip -r "${uploadZipFile}"
+
+  # Don't bother continuing if the zip file hasn't been created.
+  if [ ! -f "${uploadZipFile}" ]; then
+    echo -e " ${red}FAILED!${reset}\n\nFailed to create ${uploadZipFile}."
+    echo "Cannot continue with automatic upload. Please upload your data manually."
+    echo
+    exit 1
+  else
+    echo -e "${green}DONE!${reset}\nCreated ${uploadZipFile}."
+  fi
+}
+
+############################
+## SLEEP HQ API FUNCTIONS ##
+############################
+
+# Get the access token which is needed to upload the files
+generateSleepHQAccessToken() {
+  local sleepHQAPIBaseURL="${1}"
+  local sleepHQClientUID="${2}"
+  local sleepHQClientSecret="${3}"
+  local params
+
+  params=()
+  params+=('-H')
+  params+=('Content-Type: application/x-www-form-urlencoded')
+  params+=('-d')
+  params+=('grant_type=password')
+  params+=('-d')
+  params+=("client_id=${sleepHQClientUID}")
+  params+=('-d')
+  params+=("client_secret=${sleepHQClientSecret}")
+  params+=('-d')
+  params+=('scope=read%20write')
+
+  # Example json output:
+  # {"access_token":"access_token_string_value","token_type":"Bearer","expires_in":7200,"refresh_token":"refresh_token_string_value","scope":"read write","created_at":1720655289}
+  curl -ks --connect-timeout 20 --max-time 300 "${sleepHQAPIBaseURL}/oauth/token" "${params[@]}" 2>/dev/null | awk -F '[:,{}]' '{for(i=1;i<=NF;i++){if($i~/"access_token\"/){print $(i+1)}}}' | sed 's/["]*//g'
+}
+
+# Get the current SleepHQ team ID for the user
+getSleepHQTeamID() {
+  local sleepHQAccessToken="${1}"
+  local sleepHQAPIBaseURL="${2}"
+
+  local params
+
+  params=()
+  params+=('-H')
+  params+=('Content-Type: application/x-www-form-urlencoded')
+  params+=('-H')
+  params+=('accept: application/vnd.api+json')
+  params+=('-H')
+  params+=("authorization: Bearer ${sleepHQAccessToken}")
+
+  # Example json output:
+  # {"data":{"id":1234,"email":"email@host.com","current_team_id":1234,"profile_photo_url":null,"owned_team_ids":[1234],"name":"My Name"}}
+  curl -ks --connect-timeout 20 --max-time 300 "${sleepHQAPIBaseURL}/api/v1/me" "${params[@]}" 2>/dev/null | awk -F '[:,{}]' '{for(i=1;i<=NF;i++){if($i~/"current_team_id\"/){print $(i+1)}}}' | sed 's/[^0-9]*//g'
+}
+
+# Create a Sleep  HQ Import task
+createImportTask() {
+  local sleepHQAccessToken="${1}"
+  local sleepHQAPIBaseURL="${2}"
+  local sleepHQTeamID="${3}"
+  local sleepHQDeviceID="${4}"
+
+  local params
+
+  params=()
+  params+=('-H')
+  params+=('Content-Type: application/x-www-form-urlencoded')
+  params+=('-H')
+  params+=('accept: application/vnd.api+json')
+  params+=('-H')
+  params+=("authorization: Bearer ${sleepHQAccessToken}")
+  params+=('-d')
+  params+=('programatic=true')
+  params+=('-d')
+  params+=("device_id=${sleepHQDeviceID}")
+
+  # Example json output:
+  # {"data":{"id":"1234567","type":"import","attributes":{"id":1234567,"team_id":1234,"name":null,"status":"uploading","file_size":null,"progress":0,"machine_id":null,"device_id":123456,"programatic":true,"failed_reason":null,"created_at":"2024-07-10 23:07:31 UTC","updated_at":"2024-07-10 23:07:31 UTC"},"relationships":{"files":{"data":[]}}}}
+  curl -ks --connect-timeout 20 --max-time 300 "${sleepHQAPIBaseURL}/api/v1/teams/${sleepHQTeamID}/imports" "${params[@]}" 2>/dev/null | awk -F '[:,{}]' '{for(i=1;i<=NF;i++){if($i~/"attributes\"/ && $(i+2)~/"id\"/){print $(i+3)}}}' | sed 's/[^0-9]*//g'
+}
+
+generateContentHash() {
+  local uploadZipFileName="${1}"
+  local os
+
+  os=$(uname)
+
+  # Generate content hash
+  # Takes the contents of the file to be uploaded and appends "upload.zip"
+  # which is the name of the file being uploaded to the end of the string.
+  # Finally it performs an md5sum of the entire string
+  case "${os}" in
+    Darwin)
+      (cat "${uploadZipFileName}"; echo "${uploadZipFileName}") | md5 -q
+    ;;
+    Linux)
+      (cat "${uploadZipFileName}"; echo "${uploadZipFileName}") | md5sum | awk '{print $1}'
+    ;;
+  esac
+}
+
+# Upload Zip file to Sleep HQ
+uploadFileToSleepHQ() {
+  local sleepHQAccessToken="${1}"
+  local sleepHQAPIBaseURL="${2}"
+  local sleepHQImportTaskID="${3}"
+  local uploadZipFileName="${4}"
+  local sleepHQcontentHash="${5}"
+
+  local params
+
+  params=()
+  params+=('-H')
+  params+=('accept: application/vnd.api+json')
+  params+=('-H')
+  params+=("authorization: Bearer ${sleepHQAccessToken}")
+  params+=('-F')
+  params+=("name=${uploadZipFileName}")
+  params+=('-F')
+  params+=('path=.%2F')
+  params+=('-F')
+  params+=("content_hash=${sleepHQcontentHash}")
+  params+=('-F')
+  params+=("file=@${uploadZipFileName}")
+
+  curl -ks --connect-timeout 20 --max-time 300 "${sleepHQAPIBaseURL}/api/v1/imports/${sleepHQImportTaskID}/files" "${params[@]}" >/dev/null
+}
+
+# Instruct Sleep HQ to unpack the zip file and process the import
+triggerDataImport() {
+  local sleepHQAccessToken="${1}"
+  local sleepHQAPIBaseURL="${2}"
+  local sleepHQImportTaskID="${3}"
+  local params
+
+  params=()
+  params+=('-H')
+  params+=('accept: application/vnd.api+json')
+  params+=('-H')
+  params+=("authorization: Bearer ${sleepHQAccessToken}")
+
+  curl -ks --connect-timeout 20 --max-time 300 -X 'POST' "${sleepHQAPIBaseURL}/api/v1/imports/${sleepHQImportTaskID}/process_files" "${params[@]}" >/dev/null
+}
+
+# wait for upload to complete and report upload progress
+monitorImportProgress() {
+  local sleepHQAccessToken="${1}"
+  local sleepHQAPIBaseURL="${2}"
+  local sleepHQImportTaskID="${3}"
+  local progress=0
+  local prevProgress=0
+  local failCounter=0
+
+  local params
+
+  params=()
+  params+=('-H')
+  params+=('accept: application/vnd.api+json')
+  params+=('-H')
+  params+=("authorization: Bearer ${sleepHQAccessToken}")
+
+  while [ "${progress}" -lt 100 ]; do
+    if [ "${progress}" -ne 0 ]; then
+      sleep 5 # Add a 5 second sleep timer to avoid API throttling
+    fi
+    # Example JSON output:
+    # {"data":{"id":"1234567","type":"import","attributes":{"id":1234567,"team_id":1234,"name":null,"status":"complete","file_size":660936,"progress":100,"machine_id":12345,"device_id":12345,"programatic":true,"failed_reason":null,"created_at":"2024-07-10 22:49:20 UTC","updated_at":"2024-07-10 22:49:29 UTC"},"relationships":{"files":{"data":[{"id":"123456789","type":"imports/file"},{"id":"123456789","type":"imports/file"},{"id":"123456789","type":"imports/file"},{"id":"123456789","type":"imports/file"}]}}}}
+    progress=$(curl -ks --connect-timeout 20 --max-time 300 "${sleepHQAPIBaseURL}/api/v1/imports/${sleepHQImportTaskID}" "${params[@]}" 2>/dev/null | awk -F '[:,]' '{for(i=1;i<=NF;i++){if($i~/"progress"/){print $(i+1)}}}' | sed 's/[^0-9]*//g')
+    echo -ne "Progress: ${progress}% complete...\r"
+    if [ "${prevProgress}" -eq "${progress}" ]; then
+      if [ "${failCounter}" -eq 12 ]; then
+        echo
+        echo "Upload progress is still at ${progress}% after 60 seconds."
+        echo
+        echo "Abandoning monitoring of Data Import. Please check the Data Import page"
+        echo "on the Sleep HQ website."
+        break
+      fi
+      ((failCounter++))
+    else
+      failCounter=0
+      prevProgress="${progress}"
+    fi
+  done
+  echo -ne "Progress: ${green}${progress}% complete${reset}...\n"
+}
+
+################################################################################################################################################
+################################################################################################################################################
+########################################################## CODE STARTS HERE ####################################################################
+################################################################################################################################################
+################################################################################################################################################
+
+# Make sure we only run the script on a mac or Linux
+case "${os}" in
+  Darwin)
+  ;;
+  Linux)
+  ;;
+  *)
+    echo "This script can only be run on a Mac (Darwin) or Linux (Raspberry Pi OS etc)."
+    exit 1
+esac
+
+# Make sure we're not the root user
+# root user permissions are not necessary
+if [ "$(id -u)" -eq 0 ]; then
+  echo "Don't run this script as the root user!"
+  exit 1
+fi
+
+# Check for updates and re-launch the script if necessary
+# versionCheck "${me}" "${@}"  # Disabled to prevent overwriting FlashAir customizations
+
+overallStart="$(date +%s)"
+
+#################################
+## SD Card directory selection ##
+#################################
+
+# This code exists solely to allow users to store
+# their sd card contents wherever they want
+case "${os}" in
+  Darwin)
+    keychainSDCardDir="$(security find-generic-password -ga "flashAirsdCardDir" 2>&1 | grep password | cut -f2- -d '"' | sed -e 's/^"//' -e 's/"$//')"
+    if [ -n "${keychainSDCardDir}" ]; then
+      sdCardDir="${keychainSDCardDir}"
+    fi
+  ;;
+  Linux)
+    # Load the value from the sdCard configuration file
+    if [ -f "${flashAirConfigDir}/flashAirsdCardDir" ]; then
+      sdCardDir="$(head -1 "${flashAirConfigDir}/flashAirsdCardDir")"
+    fi
+  ;;
+esac
+
+# Create the SD card directory if it doesn't exist
+# If the directory doesn't exist, it's either a first time user
+# or the user has opted to move the SD Card directory somewhere
+# else.
+# Ask the user where they want to store the SD card contents and 
+# remember it for the future.
+if [ ! -d "${sdCardDir}" ]; then
+  echo -e "\nSD Card directory does not exist."
+  echo -e "\nEnter the path where you would like to store SD Card files"
+  echo "or press enter to accept the default location."
+  echo -ne "\nYour selection (Default: ${sdCardDir}): "
+  read -r answer
+  if [ -n "${answer}" ]; then
+    sdCardDir="${answer}"
+    case "${os}" in
+      Darwin)
+        security add-generic-password -T "/usr/bin/security" -U -a "flashAirsdCardDir" -s "flashAir" -w "${sdCardDir}"
+      ;;
+      Linux)
+        echo "${sdCardDir}" >"${flashAirConfigDir}/flashAirsdCardDir"
+      ;;
+    esac
+  fi
+  echo
+  if [ ! -d "${sdCardDir}" ]; then
+    mkdir -p "${sdCardDir}"
+  fi 
+  echo
+fi
+
+# Reset the following global variables just in case they've changed
+uploadZipFile="${sdCardDir}/${uploadZipFileName}" # The absolute path to the Zip file containing files needing to be uploaded
+lastRunFile="${sdCardDir}/.sync_last_run_time" # stores the last time the script was executed. DO NOT CHANGE THE NAME OF THIS FILE WITHOUT UPDATING findFilesInDir
+lockfile="${sdCardDir}/.sync.sh.lock" # A temporary file used to make sure only one instance of the script can be executed at a time
+
+#################################
+####### Linux Config Dir  #######
+#################################
+
+if [ "${os}" == "Linux" ]; then
+  test ! -d "${flashAirConfigDir}" && mkdir -m 700 -p "${flashAirConfigDir}"
+fi
+
+#################################
+####### Lockfile creation #######
+#################################
+
+case "${os}" in
+  Darwin)
+    # Try to create a lock using shlock or exit if one already exists
+    if ! shlock -p $$ -f "${lockfile}"; then
+      echo "Script is already running or you need to remove ${lockfile}."
+      exit 1
+    fi
+  ;;
+  Linux)
+    exec 200>"${lockfile}"
+    if ! flock -n 200; then
+      echo "Script is already running or you need to remove ${lockfile}."
+      exit 1
+    fi
+  ;;
+esac
+
+############################
+## Wifi adaptor discovery ##
+############################
+
+case "${os}" in
+  Darwin)
+    wifiAdaptors="$(networksetup -listallhardwareports | egrep -A1 '802.11|Wi-Fi' | awk '/Device/ {print $2}' | sort -n)"
+    fallback="$(networksetup -listallhardwareports | egrep -A1 '802.11|Wi-Fi')"
+    ;;
+  Linux)
+    wifiAdaptors="$(
+      for iface in /sys/class/net/*; do
+        [[ -d "${iface}/wireless" ]] && basename "${iface}"
+      done
+    )"
+    fallback="$(ls /sys/class/net)"
+    ;;
+  *)
+    echo "Unsupported OS: ${os}" >&2
+    exit 1
+    ;;
+esac
+
+numWifiAdaptors=$(echo "${wifiAdaptors}" | grep -c .)
+
+if (( ${numWifiAdaptors} == 0 )); then
+  echo "Couldn't identify a valid Wi-Fi adaptor. Found these instead:"
+  echo "${fallback}"
+  exit 1
+fi
+
+#######################################
+## Sleep HQ credential specification ##
+#######################################
+
+# Sleep HQ Upload Credentials
+case "${os}" in
+  Darwin)
+    # from the users Login keychain.
+    sleepHQClientUID="$(security find-generic-password -ga "sleepHQClientUID" 2>&1 | grep password | cut -f2- -d '"' | sed -e 's/^"//' -e 's/"$//')"
+    sleepHQClientSecret="$(security find-generic-password -ga "sleepHQClientSecret" 2>&1 | grep password | cut -f2- -d '"' | sed -e 's/^"//' -e 's/"$//')"
+    sleepHQDeviceID="$(security find-generic-password -ga "sleepHQDeviceID" 2>&1 | grep password | cut -f2- -d '"' | sed -e 's/^"//' -e 's/"$//')"
+  ;;
+  Linux)
+    # from config files
+    if [ -f "${flashAirConfigDir}/sleepHQClientUID" ]; then
+      sleepHQClientUID="$(head -1 "${flashAirConfigDir}/sleepHQClientUID")"
+    fi
+    if [ -f "${flashAirConfigDir}/sleepHQClientSecret" ]; then
+      sleepHQClientSecret="$(head -1 "${flashAirConfigDir}/sleepHQClientSecret")"
+    fi
+    if [ -f "${flashAirConfigDir}/sleepHQDeviceID" ]; then
+      sleepHQDeviceID="$(head -1 "${flashAirConfigDir}/sleepHQDeviceID")"
+    fi
+  ;;
+esac
+
+# If any of the credentials do not exist
+# it's assumed that they've never been asked to create them
+# Explicitly saying "n" will permanently disable this check.
+if [ -z "${sleepHQClientUID}" ] ||
+   [ -z "${sleepHQClientSecret}" ] ||
+   [ -z "${sleepHQDeviceID}" ]; then
+  echo -n "Would you like to enable automatic uploads to SleepHQ? (y/n): "
+  read -r answer
+
+  case "${answer}" in
+    [yY][eE][sS]|[yY])
+      echo
+      while [ -z "${sleepHQClientUID}" ]; do
+        echo -n "Please enter your Sleep HQ Client UID: "
+        read -r sleepHQClientUID
+      done
+      echo
+      while [ -z "${sleepHQClientSecret}" ]; do
+        echo -n "Please enter your Sleep HQ Client Secret: "
+        read -r sleepHQClientSecret
+      done
+
+      # Create the necessary entries in the users Login keychain.
+      case "${os}" in
+        Darwin)
+          # Create the necessary entries in the users Login keychain 
+          security add-generic-password -T "/usr/bin/security" -U -a "sleepHQClientUID" -s "flashAir" -w "${sleepHQClientUID}"
+          security add-generic-password -T "/usr/bin/security" -U -a "sleepHQClientSecret" -s "flashAir" -w "${sleepHQClientSecret}"
+          if [ "${sleepHQClientUID}" == "$(security find-generic-password -ga "sleepHQClientUID" 2>&1 | grep password | cut -f2- -d '"' | sed -e 's/^"//' -e 's/"$//')" ] &&
+             [ "${sleepHQClientSecret}" == "$(security find-generic-password -ga "sleepHQClientSecret" 2>&1 | grep password | cut -f2- -d '"' | sed -e 's/^"//' -e 's/"$//')" ]; then
+            echo
+            echo "Sleep HQ Client UID ( sleepHQClientUID ) and Client Secret ( sleepHQClientSecret ) are now saved to your keychain."
+            echo
+            else
+            echo
+            echo "An error occurred while trying to save your Sleep HQ credentials. Script execution will still continue."
+            echo
+          fi
+
+        ;;
+        Linux)
+          # In the relevant configuration files
+          echo "${sleepHQClientUID}" >"${flashAirConfigDir}/sleepHQClientUID"
+          echo "${sleepHQClientSecret}" >"${flashAirConfigDir}/sleepHQClientSecret"
+
+          if grep -Fxq "${sleepHQClientUID}" "${flashAirConfigDir}/sleepHQClientUID" && \
+             grep -Fxq "${sleepHQClientSecret}" "${flashAirConfigDir}/sleepHQClientSecret"; then
+            echo
+            echo "Sleep HQ Client UID ( sleepHQClientUID ) and Client Secret ( sleepHQClientSecret ) have been successfully saved."
+            echo
+            else
+            echo
+            echo "An error occurred while trying to save your Sleep HQ credentials. Script execution will still continue."
+            echo
+          fi
+        ;;
+      esac
+
+      if [ "${sleepHQClientUID}" != "false" ] &&
+         [ -n "${sleepHQClientUID}" ] &&
+         [ "${sleepHQClientSecret}" != "false" ] &&
+         [ -n "${sleepHQClientSecret}" ]; then
+        echo
+        echo -ne "Testing Sleep HQ API Credentials..."
+        if [ -z "${sleepHQAccessToken}" ]; then
+          sleepHQAccessToken=$(generateSleepHQAccessToken "${sleepHQAPIBaseURL}" "${sleepHQClientUID}" "${sleepHQClientSecret}")
+        fi
+        
+        # Make sure we've got an access token.
+        # If we've got an empty value for the ${sleepHQAccessToken}
+        # we've failed to get one and can't continue
+        if [ -z "${sleepHQAccessToken}" ]; then
+          echo -e " ${red}FAILED!${reset}\n\nFailed to obtain a Sleep HQ API Access Token."
+          echo "Make sure your Client UID and Secret are correct and"
+          echo "you can access the https://sleephq.com website in your"
+          echo "web browser."
+          echo
+          echo "Debug output for troubleshooting is shownn below: "
+          echo
+          echo "Command:"
+          echo "curl --connect-timeout 20 --max-time 300 -X 'POST' \"${sleepHQLoginURL}\""
+          echo
+          echo -n "Output: "
+          curl -k --connect-timeout 20 --max-time 300 -X 'POST' "${sleepHQLoginURL}"
+          echo
+          echo
+          echo "Cannot continue... Rolling back Sleep HQ configuration and exiting..."
+          echo
+          bash "${me}" --remove-sleephq
+          exit 1
+        else
+          echo -e " ${green}PASSED!${reset}"
+        fi
+
+        # Ask the user to provide their device type
+        echo -e "\nWhat kind of CPAP device are you using with automated uploads? Enter an ID from the list below: \n"
+
+        curl -ks --connect-timeout 20 --max-time 300 "${sleepHQAPIBaseURL}/api/v1/devices" -H 'accept: application/vnd.api+json' -H "authorization: Bearer ${sleepHQAccessToken}" | awk '
+          function json_value(key) {
+              match($0, "\"" key "\": *\"[^\"]*\"")
+              value = substr($0, RSTART, RLENGTH)
+              gsub("\"" key "\": *\"", "", value)
+              gsub("\"", "", value)
+              return value
+          }
+
+          {
+              while (match($0, "\"id\"[ \t]*:[ \t]*\"[^\"]+\"")) {
+                  device_id = json_value("id")
+                  device_name = json_value("name")
+                  if (device_id && device_name) {
+                      device_ids[++id_count] = device_id
+                      device_names[id_count] = device_name
+                      sub("\"id\"[ \t]*:[ \t]*\"[^\"]+\"", "", $0)
+                      sub("\"name\"[ \t]*:[ \t]*\"[^\"]+\"", "", $0)
+                  }
+              }
+          }
+
+          END {
+              print "Device IDs\tDevice Names"
+              for (i = 1; i <= id_count; i++) {
+                  printf "%s\t\t%s\n", device_ids[i], device_names[i]
+              }
+          }'
+        echo -ne "\nDevice ID: "
+        read -r sleepHQDeviceID
+        case "${os}" in
+          Darwin)
+            # Create the necessary entries in the users Login keychain 
+            security add-generic-password -T "/usr/bin/security" -U -a "sleepHQDeviceID" -s "flashAir" -w "${sleepHQDeviceID}"
+            if [ "${sleepHQDeviceID}" == "$(security find-generic-password -ga "sleepHQDeviceID" 2>&1 | grep password | cut -f2- -d '"' | sed -e 's/^"//' -e 's/"$//')" ]; then
+              echo
+              echo "Sleep HQ Device ID successfully added to your keychain."
+            fi
+          ;;
+          Linux)
+            # In the relevant configuration files
+            echo "${sleepHQDeviceID}" >"${flashAirConfigDir}/sleepHQDeviceID"
+            grep -Fxq "${sleepHQDeviceID}" "${flashAirConfigDir}/flashAirWifiSSID" && echo "Sleep HQ Device ID successfully saved to ${flashAirConfigDir}/sleepHQDeviceID."
+          ;;
+        esac
+        echo
+        echo "Sleep HQ Automatic uploads are now enabled."
+        sleepHQuploadsEnabled=true
+      else
+        echo
+        echo "Failed to add Sleep HQ Client UID ( sleepHQClientUID ) and Client Secret ( sleepHQClientSecret ) to your keychain. Please try again..."
+        exit 1
+      fi
+    ;;
+    [nN][oO]|[nN])
+      # Set the sleepHQClientUID and sleepHQClientSecret values to false
+      # When the script starts, it will skip asking the user if they want to
+      # configure Sleep HQ automatic uploads because there is a value set
+      sleepHQClientUID="false"
+      sleepHQClientSecret="false"
+      sleepHQDeviceID="false"
+      case "${os}" in
+        Darwin)
+          security add-generic-password -T "/usr/bin/security" -U -a "sleepHQClientUID" -s "flashAir" -w "${sleepHQClientUID}" # set the value to false
+          security add-generic-password -T "/usr/bin/security" -U -a "sleepHQClientSecret" -s "flashAir" -w "${sleepHQClientSecret}" # set the value to false
+          security add-generic-password -T "/usr/bin/security" -U -a "sleepHQDeviceID" -s "flashAir" -w "${sleepHQDeviceID}" # set the value to false
+        ;;
+        Linux)
+          echo "false" >"${flashAirConfigDir}/sleepHQClientUID"
+          echo "false" >"${flashAirConfigDir}/sleepHQClientSecret"
+          echo "false" >"${flashAirConfigDir}/sleepHQDeviceID"
+        ;;
+      esac
+    ;;
+  esac
+fi
+
+# Enable automatic Sleep HQ uploads if credentials
+# have been configured in the keychain and those credentials
+# are not set to the string lteral "false"
+if [ "${sleepHQClientUID}" != "false" ] &&
+   [ -n "${sleepHQClientUID}" ] &&
+   [ "${sleepHQClientSecret}" != "false" ] &&
+   [ -n "${sleepHQClientSecret}" ]; then
+  sleepHQuploadsEnabled=true
+fi
+
+# Iterate over command line arguments
+# Command line arguments can perform overrides
+# so must be performed just before the script
+# actually begins execution.
+for arg in ${@}; do
+  case "${arg}" in
+    "--dedicated")
+      if [ "${numWifiAdaptors}" -lt 2 ]; then
+        exit 0
+      fi
+    ;;
+    "--full-sync")
+    fastsyncEnabled=false
+    ;;
+    "--skip-sync")
+    sleepDataSyncEnabled=false
+    ;;
+    "--skip-upload")
+    sleepHQuploadsEnabled=false
+    ;;
+    "--skip-o2")
+    o2RingSyncEnabled=false
+    ;;
+    "--remove-sleephq")
+      case "${os}" in
+        Darwin)
+          output="$(security -q delete-generic-password -a sleepHQClientUID 2>&1)"
+          verifyKeychainAction delete sleepHQClientUID $? "${output}"
+          output="$(security -q delete-generic-password -a sleepHQClientSecret 2>&1)"
+          verifyKeychainAction delete sleepHQClientSecret $? "${output}"
+          output="$(security -q delete-generic-password -a sleepHQDeviceID 2>&1)"
+          verifyKeychainAction delete sleepHQDeviceID $? "${output}"
+        ;;
+        Linux)
+          test -f "${flashAirConfigDir}/sleepHQClientUID" && rm -vf "${flashAirConfigDir}/sleepHQClientUID"
+          test -f "${flashAirConfigDir}/sleepHQClientSecret" && rm -vf "${flashAirConfigDir}/sleepHQClientSecret"
+          test -f "${flashAirConfigDir}/sleepHQDeviceID" && rm -vf "${flashAirConfigDir}/sleepHQDeviceID"
+        ;;
+      esac
+      echo
+      exit 0
+    ;;
+    "--remove-flashair")
+      case "${os}" in
+        Darwin)
+          output="$(security -q delete-generic-password -a flashAirWifiSSID 2>&1)"
+          verifyKeychainAction delete flashAirWifiSSID $? "${output}"
+          output="$(security -q delete-generic-password -a flashAirWiFiPassword 2>&1)"
+          verifyKeychainAction delete flashAirWiFiPassword $? "${output}"
+        ;;
+        Linux)
+          test -f "${flashAirConfigDir}/flashAirWifiSSID" && rm -vf "${flashAirConfigDir}/flashAirWifiSSID"
+          test -f "${flashAirConfigDir}/flashAirWiFiPassword" && rm -vf "${flashAirConfigDir}/flashAirWiFiPassword"
+        ;;
+      esac
+      echo
+      exit 0
+    ;;
+    "--remove-home")
+      case "${os}" in
+        Darwin)
+          output="$(security -q delete-generic-password -a homeWiFiSSID 2>&1)"
+          verifyKeychainAction delete homeWiFiSSID $? "${output}"
+          output="$(security -q delete-generic-password -a homeWiFiPassword 2>&1)"
+          verifyKeychainAction delete homeWiFiPassword $? "${output}"
+        ;;
+        Linux)
+          test -f "${flashAirConfigDir}/homeWiFiSSID" && rm -vf "${flashAirConfigDir}/homeWiFiSSID"
+          test -f "${flashAirConfigDir}/homeWiFiPassword" && rm -vf "${flashAirConfigDir}/homeWiFiPassword"
+        ;;
+      esac
+      echo
+      exit 0
+    ;;
+    "--remove-all")
+      bash "${me}" --remove-sleephq
+      bash "${me}" --remove-flashair
+      bash "${me}" --remove-home
+      exit 0
+    ;;
+    "--reset-sd")
+      case "${os}" in
+        Darwin)
+          output="$(security -q delete-generic-password -a flashAirsdCardDir 2>&1)"
+          verifyKeychainAction delete flashAirsdCardDir $? "${output}"
+        ;;
+        Linux)
+          test -f "${flashAirConfigDir}/flashAirsdCardDir" && rm -vf "${flashAirConfigDir}/flashAirsdCardDir"
+        ;;
+      esac
+      echo
+      exit 0
+    ;;
+    "--max-streams="*)
+      maxParallelDirChecks="$(echo "${arg}" | cut -f2 -d '=')"
+    ;;
+    "--max-downloads="*)
+      maxParallelDownloads="$(echo "${arg}" | cut -f2 -d '=')"
+    ;;
+    "-v"|"--version")
+    echo "sync.sh version $(grep '^# VERSION=' "$0" 2>/dev/null | cut -f2 -d '=')"
+    exit 0
+    ;;
+    "--connection-check")
+      case "${os}" in
+        Darwin)
+          open -a safari https://youtu.be/dQw4w9WgXcQ?si=ciWPSSKqphW4gkvz
+        ;;
+        Linux)
+          nc towel.blinkenlights.nl 23
+        ;;
+      esac
+    exit 0
+    ;;
+       "-h"|"--help")
+      echo "sync.sh <options>"
+      echo
+      echo "Options:"
+      echo
+      echo "Disables fast sync if missing files in a directory aren't being downloaded:"
+      echo "${0} --full-sync"
+      echo
+      echo "Don't sync files from the SD Card:"
+      echo "${0} --skip-sync"
+      echo
+      echo "Don't upload files to Sleep HQ:"
+      echo "${0} --skip-upload"
+      echo
+      echo "Don't sync O2 CSV export files to Sleep HQ:"
+      echo "${0} --skip-o2"
+      echo
+      echo "Set the number of parallel streams to run when checking files/directories:"
+      echo "${0} --max-streams=15"
+      echo
+      echo "Set the number of parallel downloads to execute:"
+      echo "${0} --max-downloads=5"
+      echo
+      echo "Remove Sleep HQ credentials from your keychain:"
+      echo "${0} --remove-sleephq"
+      echo
+      echo "Remove FlashAir WiFi SD card WiFi SSID and password from your keychain:"
+      echo "${0} --remove-flashair"
+      echo
+      echo "Remove home WiFi credentials from your keychain:"
+      echo "${0} --remove-home"
+      echo
+      echo "Remove all credentials (home/flashair/sleephq):"
+      echo "${0} --remove-credentials"
+      echo
+      echo "Reset SD Card location in keychain:"
+      echo "${0} --reset-sd"
+      echo
+      echo "Dual wifi adaptor automation mode:"
+      echo "${0} --dedicated"
+      echo
+      echo "Check internet connectivity:"
+      echo "${0} --connection-check"
+      echo
+      echo "Show version information:"
+      echo "${0} --version"
+      exit 0
+    ;;
+  esac
+done
+
+#############################################
+## INSTALLATION/PRE-FLIGHT CHECKS COMPLETE ##
+########## SCRIPT EXECUTION BEGINS ##########
+#############################################
+
+if ${sleepDataSyncEnabled}; then
+  # Make sure we can connect to the home WiFi network
+  # because there's not much point in continuing if the
+  # the user hasn't got their own WiFi details set correctly
+#  if [ "${numWifiAdaptors}" -eq 1 ]; then
+#    echo -e "\nChecking WiFi connectivity to ${homeWiFiSSID} before we begin...\n"
+#    if ! connectToWifiNetwork "${wifiAdaptor}" "${homeWiFiSSID}" "${homeWiFiPassword}"; then
+#      exit 1 # Failed to connect to the wifi network
+#    fi
+#  fi
+
+  lastRunDateInSeconds=$(getLastRunTimestamp "${lastRunFile}" "${sdCardDir}/DATALOG")
+  if [ "${lastRunDateInSeconds}" -gt 0 ]; then
+    case "${os}" in
+      Darwin)
+        lastSync=$(date -r "${lastRunDateInSeconds}" +"%Y-%m-%d %H:%M:%S")
+        ;;
+      Linux)
+        lastSync=$(date -d "@${lastRunDateInSeconds}" +"%Y-%m-%d %H:%M:%S")
+        ;;
+      *)
+        echo "Unsupported OS: ${os}" >&2
+        exit 1
+        ;;
+    esac
+
+    echo -e "\nLast successful SD Card synchronization: "${lastSync}"\n"
+  else
+    echo -e "\nCould not reliably determine the last time a successful"
+    echo "SD card synchronization was performed. This is usually because"
+    echo "the ${sdCardDir} is empty."
+    echo -e "\nScript will synchronize all data from the SD Card. Press"
+    echo "any key to continue or Control + C to exit."
+    read -r answer
+  fi
+
+  # Set a default path to the file sync log
+  # The file is used to determine which directories
+  # need to be added to the zip file
+  if [ -d "/var/tmp" ]; then
+    tmpDir="/var/tmp"
+  else
+    tmpDir="/tmp"
+  fi
+
+  transferListFile="${tmpDir}/sync_transfer_list.log" # Contains a semi-colon separated list of URLs and local directory paths
+
+  # remove the transfer list file so we know if it doesn't exist
+  # there were no files that needed to be downloaded
+  test -f "${transferListFile}" && rm -f "${transferListFile}"
+
+  trap exitFunction INT TERM EXIT
+
+  # Connect to the wifi network
+  # if [ "${numWifiAdaptors}" -eq 1 ]; then
+  #  if ! connectToWifiNetwork "${wifiAdaptor}" "${flashAirWifiSSID}" "${flashAirWiFiPassword}"; then
+  #    exit 1 # We failed to connect to the wifi network
+  #  fi
+  #  flashAirConnected=1 # Ensures we reconnect to the home wifi network if anything fails
+  # fi
+
+  echo -ne "\nVerifying connectivity to FlashAir Web Interface..."
+  if waitForConnectivity "${flashAirURL}"
+    then
+    echo -e " ${green}DONE!${reset}"
+
+  fi
+
+  start="$(date +%s)"
+  echo -ne "\nSearching SD Card for directories to check..."
+  # Discover all of the directories on the SD card
+  # store the URL in the dirList array
+  while IFS=' ' read -r item; do
+      dirList+=("$item")
+  done <<< "$(findRemoteDirs "${maxParallelDirChecks}" "${flashAirURL}" "${dirList[0]}" "${sdCardDir}")"
+  wait
+
+  end="$(date +%s)"
+  timeTaken=$(( end - start ))
+  echo -e " ${green}DONE!${reset} Time taken: ${timeTaken} seconds."
+
+  start="$(date +%s)"
+  echo -e "\nSearching SD Card directories for files to download..."
+  for remoteDirPath in "${dirList[@]}"; do
+    echo "Checking ${flashAirURL}$(echo "${remoteDirPath}" | sed 's|//|/|g')"
+    findFilesInDir "${flashAirURL}" "${remoteDirPath}" "${sdCardDir}" "${transferListFile}" "${lastRunDateInSeconds}" "${fastsyncEnabled}" &
+    # Limit the number of parallel jobs
+    if [[ $(jobs -r -p | wc -l) -ge ${maxParallelDirChecks} ]]; then
+      wait
+    fi
+  done
+  wait
+
+  end="$(date +%s)"
+  timeTaken=$(( end - start ))
+  echo -e "\nDone searching SD card for files to download. Time taken: ${timeTaken} seconds."
+
+  # Transfer list file is only populated when it's actually identified files to download
+  # If there's no files to download, we must be up to date and there's no reason to continue
+  if [ ! -f "${transferListFile}" ]; then
+    # if [ "${numWifiAdaptors}" -eq 1 ]; then
+      # Make sure we reconnect to the home wifi network
+      # because we don't need the SD card anymore
+      # if ! connectToWifiNetwork "${wifiAdaptor}" "${homeWiFiSSID}" "${homeWiFiPassword}"; then
+        # exit 1 # We failed to connect to the wifi network
+      # fi
+      # flashAirConnected=0 # disables automatic reconnection to home wifi because we're already connected
+      # waitForConnectivity "${sleepHQAPIBaseURL}"
+    # fi
+    echo -e "\nLocal filesystem is already up to date with SD Card."
+  else
+    echo -e "\nStarting SD card sync\n"
+    flashAirSyncInProgress=1
+    start="$(date +%s)"
+    numFiles="$(cat ${transferListFile} | wc -l | awk '{print $1}')"
+    downloadFiles "${maxParallelDownloads}" "${transferListFile}" "${sdCardDir}"
+    end="$(date +%s)"
+    timeTaken=$(( end - start ))
+    echo -e "\nSD card sync complete. Time taken: ${timeTaken} seconds. Files downloaded: ${numFiles} files.\n"
+    flashAirSyncInProgress=0
+    
+    # if [ "${numWifiAdaptors}" -eq 1 ]; then
+    #  if ! connectToWifiNetwork "${wifiAdaptor}" "${homeWiFiSSID}" "${homeWiFiPassword}"; then
+    #    exit 1 # We failed to connect to the wifi network
+    #  fi
+    #  flashAirConnected=0 # disables automatic reconnection to home wifi because we're already connected
+    # fi
+
+    waitForConnectivity "${sleepHQAPIBaseURL}"
+
+    # if there's no sleep data, there's no point continuing
+    # user was probably uploading files only.
+    if ! grep -qE ';DATALOG/[0-9]+/' ${transferListFile} 2>/dev/null; then
+      echo
+      echo "Data was synchronized from the SD card but none of it was sleep data."
+      echo "This usually happens if configuration files have changed but you" 
+      echo "haven't recorded new sleep data yet."
+      storeLastRunTimestamp "$(date +%s)" "${lastRunFile}"
+    else
+      storeLastRunTimestamp "$(date +%s)" "${lastRunFile}"
+      # If uploads to sleep HQ are enabled, create the zip file and upload it.
+      if ${sleepHQuploadsEnabled}; then
+        start="$(date +%s)"
+
+        # upload zip file has been copied to iCloud. Evict the local copy and remove the .icloud file
+        icloudPlaceholderFile="${sdCardDir}/.${uploadZipFileName}.icloud"
+        if [[ "${os}" == "Darwin" && -f "${icloudPlaceholderFile}" ]]; then
+          brctl evict "${icloudPlaceholderFile}"
+          rm -f "${icloudPlaceholderFile}"
+        fi
+
+        createSleepDataZipFile "${uploadZipFile}" "${transferListFile}"
+        end="$(date +%s)"
+        timeTaken=$(( end - start ))
+        echo -e "\nZip file creation complete. Time taken: ${timeTaken} seconds.\n"
+
+        # Disable trapping because API errors will cause the script to terminate prematurely with no explanation.
+        trap - INT TERM EXIT
+
+        start="$(date +%s)"
+
+        # Generate an API token if necessary
+        if [ -z "${sleepHQAccessToken}" ]; then
+          echo -ne "\nConnecting to Sleep HQ..."
+          sleepHQAccessToken=$(generateSleepHQAccessToken "${sleepHQAPIBaseURL}" "${sleepHQClientUID}" "${sleepHQClientSecret}")
+
+          # Make sure we've got an access token.
+          # If we've got an empty value for the ${sleepHQAccessToken}
+          # we've failed to get one and can't continue
+          if [ -z "${sleepHQAccessToken}" ]; then
+            echo -e " ${red}FAILED!${reset}\n\nFailed to obtain a Sleep HQ API Access Token."
+            echo "Make sure your Client UID and Secret are correct and"
+            echo "you can access the https://sleephq.com website in your"
+            echo "web browser."
+            echo -e "\nDebug output for troubleshooting is shown below: "
+            echo -e "\nCommand:"
+            echo "curl --connect-timeout 20 --max-time 300 -X 'POST' \"${sleepHQLoginURL}\""
+            echo -ne "\nOutput: "
+            curl -k --connect-timeout 20 --max-time 300 -X 'POST' "${sleepHQLoginURL}"
+            echo -e "\n\nCannot continue with upload... exiting now..."
+            exit 1
+          else
+            echo -e " ${green} DONE!${reset}"
+          fi
+        fi
+
+        # get the Sleep HQ team ID if necessary
+        if [ -z "${sleepHQTeamID}" ];then
+            echo -ne "\nObtaining Sleep HQ Team ID..."
+            sleepHQTeamID=$(getSleepHQTeamID "${sleepHQAccessToken}" "${sleepHQAPIBaseURL}")
+            # Team ID is expected to be a number. If it's not something went wrong.
+            if ! [[ ${sleepHQTeamID} =~ ^[0-9]+$ ]]; then
+              echo -e " ${red}FAILED!${reset}\n\nFailed to obtain your Sleep HQ Team ID. Debug output for troubleshooting is shownn below: "
+              echo -e "\nCommand:"
+              echo "curl --connect-timeout 20 --max-time 300 \"${sleepHQAPIBaseURL}/api/v1/me\" -H 'accept: application/vnd.api+json' -H \"authorization: Bearer ${sleepHQAccessToken}\""
+              echo -ne "\nOutput: "
+              curl -k --connect-timeout 20 --max-time 300 "${sleepHQAPIBaseURL}/api/v1/me" -H 'accept: application/vnd.api+json' -H "authorization: Bearer ${sleepHQAccessToken}"
+              echo -e "\nCannot continue with upload... exiting now..."
+              exit 1
+            fi
+            echo -e " ${green}DONE!${reset} Sleep HQ Team ID set to ${sleepHQTeamID}."
+        fi
+
+        # Create an Import task
+        echo -ne "\nCreating Data Import task..."
+        sleepHQImportTaskID=$(createImportTask "${sleepHQAccessToken}" "${sleepHQAPIBaseURL}" "${sleepHQTeamID}" "${sleepHQDeviceID}")
+    
+
+        # Import Task ID is expected to be a number. If it's not something went wrong.
+        if ! [[ ${sleepHQImportTaskID} =~ ^[0-9]+$ ]]; then
+          echo -e " ${red}FAILED!${reset}\n\nFailed to generate an Import Task ID. Debug output for troubleshooting is shownn below: \n"
+          echo "Command:"
+          echo -e "curl --connect-timeout 20 --max-time 300 -X 'POST' \"${sleepHQImportTaskURL}\" -H 'accept: application/vnd.api+json' -H \"authorization: Bearer ${sleepHQAccessToken}\"\n"
+          echo -n "Output: "
+          curl -k --connect-timeout 20 --max-time 300 -X 'POST' "${sleepHQImportTaskURL}" -H 'accept: application/vnd.api+json' -H "authorization: Bearer ${sleepHQAccessToken}"
+          echo -e "\n\nCannot continue with upload... exiting now..."
+          exit 1
+        else
+           echo -e "${green}DONE!${reset} Import Task ID: ${sleepHQImportTaskID}"
+        fi  
+
+        # Start trapping exit signals so we remove the
+        # import task ID if anything goes wrong.
+        trap exitFunction INT TERM EXIT
+
+        sleepHQcontentHash=$(generateContentHash "${uploadZipFileName}")
+        
+        echo -ne "\nUploading ${uploadZipFileName} to Sleep HQ..."
+        if uploadFileToSleepHQ "${sleepHQAccessToken}" "${sleepHQAPIBaseURL}" "${sleepHQImportTaskID}" "${uploadZipFileName}" "${sleepHQcontentHash}"
+          then
+          echo -e " ${green}DONE!${reset}"
+          else
+          echo -e " ${red}FAILED!${reset}"
+          exit 1
+        fi
+
+        echo -e "\nBeginning Data Import processing of ${uploadZipFileName}...\n"
+        triggerDataImport "${sleepHQAccessToken}" "${sleepHQAPIBaseURL}" "${sleepHQImportTaskID}"
+
+        monitorImportProgress "${sleepHQAccessToken}" "${sleepHQAPIBaseURL}" "${sleepHQImportTaskID}"
+
+        # Remove exit trapping because upload has either finished or been abandoned.
+        trap - INT TERM EXIT
+
+        end="$(date +%s)"
+        timeTaken=$(( end - start ))
+        echo -e "\nUpload to Sleep HQ complete. Time taken: ${timeTaken} seconds.\n"
+      fi
+    fi
+  fi
+fi
+
+if ${o2RingSyncEnabled} && ${sleepHQuploadsEnabled}; then
+  if ls "${sdCardDir}"/*.csv 1>/dev/null 2>&1; then
+    echo -e "\nO2 Ring CSV files found in ${sdCardDir}. Uploading them to Sleep HQ."
+
+    # Change the device ID to the "O2 Ring"
+    sleepHQDeviceID="${o2RingDeviceID}"
+
+    # upload zip file has been copied to iCloud. Evict the local copy and remove the .icloud file
+    icloudPlaceholderFile="${sdCardDir}/.${uploadZipFileName}.icloud"
+    if [[ "${os}" == "Darwin" && -f "${icloudPlaceholderFile}" ]]; then
+      brctl evict "${icloudPlaceholderFile}"
+      rm -f "${icloudPlaceholderFile}"
+    fi
+
+    # Create a zip archive of the csv file(s)
+    createO2RingDataZipFile "${uploadZipFile}"
+
+    # Disable trapping because API errors will cause the script to terminate prematurely with no explanation.
+    trap - INT TERM EXIT
+
+    # Generate an API token if necessary
+    if [ -z "${sleepHQAccessToken}" ]; then
+      echo -ne "\nConnecting to Sleep HQ..."
+      sleepHQAccessToken=$(generateSleepHQAccessToken "${sleepHQAPIBaseURL}" "${sleepHQClientUID}" "${sleepHQClientSecret}")
+
+      # Make sure we've got an access token.
+      # If we've got an empty value for the ${sleepHQAccessToken}
+      # we've failed to get one and can't continue
+      if [ -z "${sleepHQAccessToken}" ]; then
+        echo -e " ${red}FAILED!${reset}\n\nFailed to obtain a Sleep HQ API Access Token."
+        echo "Make sure your Client UID and Secret are correct and"
+        echo "you can access the https://sleephq.com website in your"
+        echo "web browser."
+        echo -e "\nDebug output for troubleshooting is shownn below: "
+        echo -e "\nCommand:"
+        echo "curl --connect-timeout 20 --max-time 300 -X 'POST' \"${sleepHQLoginURL}\""
+        echo -ne "\nOutput: "
+        curl -k --connect-timeout 20 --max-time 300 -X 'POST' "${sleepHQLoginURL}"
+        echo -e "\n\nCannot continue with upload... exiting now..."
+        exit 1
+      else
+        echo -e " ${green}DONE!${reset}"
+      fi
+    fi
+
+    # get the Sleep HQ team ID if necessary
+    if [ -z "${sleepHQTeamID}" ];then
+      echo -ne "\nObtaining Sleep HQ Team ID..."
+      sleepHQTeamID=$(getSleepHQTeamID "${sleepHQAccessToken}" "${sleepHQAPIBaseURL}")
+      # Team ID is expected to be a number. If it's not something went wrong.
+      if ! [[ ${sleepHQTeamID} =~ ^[0-9]+$ ]]; then
+        echo -e " ${red}FAILED!${reset}\n\nFailed to obtain your Sleep HQ Team ID. Debug output for troubleshooting is shown below: "
+        echo -e "\nCommand:"
+        echo "curl --connect-timeout 20 --max-time 300 \"${sleepHQAPIBaseURL}/api/v1/me\" -H 'accept: application/vnd.api+json' -H \"authorization: Bearer ${sleepHQAccessToken}\""
+        echo -ne "\nOutput: "
+        curl -k --connect-timeout 20 --max-time 300 "${sleepHQAPIBaseURL}/api/v1/me" -H 'accept: application/vnd.api+json' -H "authorization: Bearer ${sleepHQAccessToken}"
+        echo -e "\nCannot continue with upload... exiting now..."
+        exit 1
+      fi
+      echo -e " ${green}DONE!${reset} Sleep HQ Team ID set to ${sleepHQTeamID}."
+    fi
+
+    # Create an Import task
+    echo -ne "\nCreating Data Import task..."
+    sleepHQImportTaskID=$(createImportTask "${sleepHQAccessToken}" "${sleepHQAPIBaseURL}" "${sleepHQTeamID}" "${sleepHQDeviceID}")
+    
+    # Import Task ID is expected to be a number. If it's not something went wrong.
+    if ! [[ ${sleepHQImportTaskID} =~ ^[0-9]+$ ]]; then
+      echo -e " ${red}FAILED!${reset}\n\nFailed to generate an Import Task ID. Debug output for troubleshooting is shown below: \n"
+      echo "Command:"
+      echo -e "curl --connect-timeout 20 --max-time 300 -X 'POST' \"${sleepHQImportTaskURL}\" -H 'accept: application/vnd.api+json' -H \"authorization: Bearer ${sleepHQAccessToken}\"\n"
+      echo -n "Output: "
+      curl -k --connect-timeout 20 --max-time 300 -X 'POST' "${sleepHQImportTaskURL}" -H 'accept: application/vnd.api+json' -H "authorization: Bearer ${sleepHQAccessToken}"
+      echo -e "\n\nCannot continue with upload... exiting now..."
+      exit 1
+    else
+      echo -e " ${green}DONE!${reset}"
+    fi  
+
+    # Start trapping exit signals so we remove the
+    # import task ID if anything goes wrong.
+    trap exitFunction INT TERM EXIT
+
+    sleepHQcontentHash=$(generateContentHash "${uploadZipFileName}")
+    
+    echo -e "\nUploading ${uploadZipFileName} to Sleep HQ..."
+    uploadFileToSleepHQ "${sleepHQAccessToken}" "${sleepHQAPIBaseURL}" "${sleepHQImportTaskID}" "${uploadZipFileName}" "${sleepHQcontentHash}"
+
+    echo -e "\nBeginning Data Import processing of ${uploadZipFileName} for Import Task ID ${sleepHQImportTaskID}..."
+    triggerDataImport "${sleepHQAccessToken}" "${sleepHQAPIBaseURL}" "${sleepHQImportTaskID}"
+
+    monitorImportProgress "${sleepHQAccessToken}" "${sleepHQAPIBaseURL}" "${sleepHQImportTaskID}"
+
+    # Remove the csv files now they've been imported
+    find "${sdCardDir}" -mindepth 1 -maxdepth 1 -type f -name "O2Ring*.csv" -exec rm -f "{}" \;
+
+    trap - INT TERM EXIT
+  fi
+fi
+
+overallEnd="$(date +%s)"
+overallTimeTaken=$(( overallEnd - overallStart ))
+
+# Remove the lock file if it exists
+if [ -f "${lockfile}" ]; then
+  rm -f "${lockfile}"
+fi
+
+echo -e "\nScript execution complete! Script execution time: ${overallTimeTaken} seconds."
