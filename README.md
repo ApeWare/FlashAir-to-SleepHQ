@@ -13,7 +13,7 @@ The purpose of this repository is to automatically retrieve ResMed CPAP sleep da
 
 
 Flowchart: Automation Components for CPAP Data Sync
-
+```
 +-------------------------------------+
 | com.user.pollflashair.plist         |
 | Purpose: launchd configurtion file |
@@ -50,7 +50,7 @@ Flowchart: Automation Components for CPAP Data Sync
 | Input: FlashAir data, credentials   |
 | Output: Local files, SleepHQ upload |
 +-------------------------------------+
-
+```
 Timing and Order:
 - launchd (plist) starts at system boot and runs poll_flashair.sh every 30 minutes.
 - poll_flashair.sh checks for new data; if yes, runs sync.sh immediately.
