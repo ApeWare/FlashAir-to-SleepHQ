@@ -57,15 +57,4 @@ Timing and Order:
 - sync.sh executes the sync and upload (runs in ~5-10 seconds typically).
 - Cycle repeats every 30 min; no user input needed after setup.
 
-# Directory Structure
-```
-~/Library/LaunchAgents/com.user.pollflashair.plist
-~/Documents/ResMed Automation/poll_flashair.sh
-~/Documents/ResMed Automation/sync.sh
-~/Dropbox/ResMed CPAP Data
-* Dropbox is not required; you can store your sleep data wherever you wish.
-```
 
-# Setup
-- Set a static IP for the FlashAir card in your router; i set 192.168.1.50, so change this to the static IP you set your FLashAir to, or change line 7 in `poll_flashair.sh`
-- Modify
