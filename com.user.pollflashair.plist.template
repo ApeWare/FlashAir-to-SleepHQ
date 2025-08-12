@@ -9,7 +9,7 @@
         <string><PATH_TO_SCRIPT>/poll_flashair.sh</string>
     </array>
     <key>StartInterval</key>
-    <integer>3600</integer> <!-- Runs every hour -->
+    <integer>3600</integer>
     <key>RunAtLoad</key>
     <true/>
     <key>StandardOutPath</key>
