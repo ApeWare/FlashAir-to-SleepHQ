@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.user.pollflashair</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string><PATH_TO_SCRIPT>/poll_flashair.sh</string>
+    </array>
+    <key>StartInterval</key>
+    <integer>3600</integer> <!-- Runs every hour -->
+    <key>RunAtLoad</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string><PATH_TO_LOGS>/sync-startup-log.txt</string>
+    <key>StandardErrorPath</key>
+    <string><PATH_TO_LOGS>/sync-error-log.txt</string>
+</dict>
+</plist>
