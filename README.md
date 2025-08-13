@@ -18,23 +18,8 @@ The synchronization process involves multiple components working together. Below
 <details>
 <summary>View Flowchart</summary>
 
-```mermaid
-graph TD
-    A[launchd (com.user.pollflashair.plist)] --> B[poll_flashair.sh]
-    B --> C[sync.sh]
-    C --> D{New/Updated Files?}
-    D -->|Yes| E[Download to sdCardDir]
-    D -->|No| F[Skip]
-    E --> G{sleepHQuploadsEnabled?}
-    G -->|Yes| H[Create Zip & Upload to SleepHQ]
-    G -->|No| F
-    C --> I[FlashAir SD Card]
+![FlashAir-to-SleepHQ Flowchart](flowchart.svg)
 
-
-
-
-Flowchart: Automation Components for CPAP Data Sync
-```
 +-------------------------------------+
 | com.user.pollflashair.plist         |
 | Purpose: launchd configurtion file |
