@@ -18,7 +18,7 @@ The synchronization process involves multiple components working together. Below
 <details>
 <summary>View Flowchart</summary>
 
-![FlashAir-to-SleepHQ Flowchart](flowchart.svg)
+![FlashAir-to-SleepHQ Flowchart](flowchart.png)
 
 +-------------------------------------+
 | com.user.pollflashair.plist         |
