@@ -4,12 +4,14 @@ Based initially on the EZShare CPAP sync script by iitggithub (MIT License at ht
 
 This repository contains scripts to synchronize data from a Toshiba FlashAir Wi-Fi SD card to SleepHQ, a sleep data management platform. It supports macOS and Linux, with automation via launchd on macOS. 
 
-## Files
+### Files
 
-- **sync.sh**: The main synchronization script. It connects to your FlashAir SD card, downloads new or updated sleep data (e.g., CPAP logs from the DATALOG directory), and optionally uploads it to SleepHQ via their API. It supports Wi-Fi switching between home and FlashAir networks, parallel file downloads, and configuration storage in the macOS keychain or Linux config files (`~/.flashair`).
-- **poll_flashair.sh**: A lightweight wrapper script that calls `sync.sh` to enable periodic automation. It resolves the path to `sync.sh` dynamically, checks its existence and executability, and logs output to `sync-startup-log.txt` and errors to `sync-error-log.txt`.
-- **com.user.pollflashair.plist.template**: A template for a macOS launchd property list file to automate `poll_flashair.sh`. Users must customize it with their local paths to schedule runs (default: every hour or on login).
-- **FlashAir Config.md**: A guide for configuring the Toshiba FlashAir SD card's CONFIG file, including setting the static IP, Wi-Fi mode, SSID, and password.
+| File | Description |
+|------|-------------|
+| **sync.sh** | The main synchronization script. It connects to your FlashAir SD card, downloads new or updated sleep data (e.g., CPAP logs from the DATALOG directory), and optionally uploads it to SleepHQ via their API. It supports Wi-Fi switching between home and FlashAir networks, parallel file downloads, and configuration storage in the macOS keychain or Linux config files (`~/.flashair`). |
+| **poll_flashair.sh** | A lightweight wrapper script that calls `sync.sh` to enable periodic automation. It resolves the path to `sync.sh` dynamically, checks its existence and executability, and logs output to `sync-startup-log.txt` and errors to `sync-error-log.txt`. |
+| **com.user.pollflashair.plist.template** | A template for a macOS launchd property list file to automate `poll_flashair.sh`. Users must customize it with their local paths to schedule runs (default: every hour or on login). |
+| **FlashAir Config.md** | A guide for configuring the Toshiba FlashAir SD card's CONFIG file, including setting the static IP, Wi-Fi mode, SSID, and password.
 
 ## System Overview
 
