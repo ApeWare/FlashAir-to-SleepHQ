@@ -20,19 +20,20 @@ The synchronization process involves multiple components working together. Below
 
 ![FlashAir-to-SleepHQ Flowchart](flowchart.png)
 
-#### Flowchart Description
-- **launchd (com.user.pollflashair.plist)**: A macOS system service that schedules and triggers the automation process, running `poll_flashair.sh` hourly or on login.
-- **poll_flashair.sh**: A wrapper script that executes `sync.sh`, resolving its path dynamically and logging output to `sync-startup-log.txt` and errors to `sync-error-log.txt`.
-- **sync.sh**: The core script that connects to the FlashAir SD card (IP 192.168.1.50), checks for new or updated files since the last run (tracked in `.sync_last_run_time`), downloads them to a local directory (e.g., `SD_Card`), and, if `sleepHQuploadsEnabled` is true, creates a zip file and uploads it to SleepHQ via their API.
-- **FlashAir SD Card**: The data source, providing sleep data (e.g., DATALOG files) accessed by `sync.sh`.
-- **User Interaction**: Users configure Wi-Fi credentials and optional SleepHQ API details interactively the first time, with command-line flags (e.g., `--skip-sync`) for control.
+### Flowchart Description
 
-This flow ensures automated, reliable data transfer from the SD card to SleepHQ, initiated by launchd.
+| Component | Description |
+|-----------|-------------|
+| **launchd (com.user.pollflashair.plist)** | A macOS system service that schedules and triggers the automation process, running `poll_flashair.sh` hourly or on login. |
+| **poll_flashair.sh** | A wrapper script that executes `sync.sh`, resolving its path dynamically and logging output to `sync-startup-log.txt` and errors to `sync-error-log.txt`. |
+| **sync.sh** | The core script that connects to the FlashAir SD card (IP 192.168.1.50), checks for new or updated files since the last run (tracked in `.sync_last_run_time`), downloads them to a local directory (e.g., `SD_Card`), and, if `sleepHQuploadsEnabled` is true, creates a zip file and uploads it to SleepHQ via their API. |
+| **FlashAir SD Card** | The data source, providing sleep data (e.g., DATALOG files) accessed by `sync.sh`. |
+| **User Interaction** | Users configure Wi-Fi credentials and optional SleepHQ API details interactively the first time, with command-line flags (e.g., `--skip-sync`) for control.
 
 ## Setup Instructions
 
 ### Prerequisites
-- A Toshiba FlashAir Wi-Fi SD card configured with IP `192.168.1.50` (edit the `flashAirURL` variable in `sync.sh` if different). Note: The FlashAir W-04 model requires a 2.4GHz Wi-Fi spectrum and supports WPA2 security (recommended for secure connections; it also supports WEP and WPA, but WPA2 is default).
+- A Toshiba FlashAir Wi-Fi SD card configured with IP `192.168.1.50` (edit the `flashAirURL` variable in `sync.sh` if different). Note: The FlashAir W-04 model requires a 2.4GHz Wi-Fi spectrum and supports WPA2 security (recommended for secure connections; it also supports WEP and WPA, but WPA2 is the default).
 - macOS or Linux system with `curl`, `bash`, and `zip` installed.
 - SleepHQ account with API credentials (optional for uploads).
 - Wi-Fi network access to both your home network and the FlashAir card.
