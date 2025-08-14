@@ -1,12 +1,15 @@
 # FlashAir-to-SleepHQ
 
-This repository contains scripts to synchronize data from a Toshiba FlashAir Wi-Fi SD card to SleepHQ, a sleep data management platform. Originally based on the EZShare CPAP sync script, it has been adapted for FlashAir cards with a custom IP (192.168.1.50) and enhanced for macOS and Linux compatibility. Last updated: 11:02 PM EDT, August 12, 2025.
+Originally based on the EZShare CPAP sync script by iitggithub (MIT License at https://github.com/iitggithub/ezshare_cpap), this project has been adapted and extended for Toshiba FlashAir Wi-Fi SD cards to automate syncing CPAP data to SleepHQ. Credit to the original developer for the inspiration and foundational code—our version has evolved significantly but acknowledges that heritage.
+
+This repository contains scripts to synchronize data from a Toshiba FlashAir Wi-Fi SD card to SleepHQ, a sleep data management platform. It supports macOS and Linux, with automation via launchd on macOS. Last updated: 11:02 PM EDT, August 12, 2025.
 
 ## Files
 
 - **sync.sh**: The main synchronization script. It connects to your FlashAir SD card, downloads new or updated sleep data (e.g., CPAP logs from the DATALOG directory), and optionally uploads it to SleepHQ via their API. It supports Wi-Fi switching between home and FlashAir networks, parallel file downloads, and configuration storage in the macOS keychain or Linux config files (`~/.flashair`).
 - **poll_flashair.sh**: A lightweight wrapper script that calls `sync.sh` to enable periodic automation. It resolves the path to `sync.sh` dynamically, checks its existence and executability, and logs output to `sync-startup-log.txt` and errors to `sync-error-log.txt`.
 - **com.user.pollflashair.plist.template**: A template for a macOS launchd property list file to automate `poll_flashair.sh`. Users must customize it with their local paths to schedule runs (default: every hour or on login).
+- **FlashAir Config.md**: A guide for configuring the Toshiba FlashAir SD card's CONFIG file, including setting the static IP, Wi-Fi mode, SSID, and password.
 
 ## System Overview
 
@@ -27,7 +30,7 @@ This flow ensures automated, reliable data transfer from the SD card to SleepHQ,
 ## Setup Instructions
 
 ### Prerequisites
-- A Toshiba FlashAir Wi-Fi SD card configured with IP `192.168.1.50` (edit the `flashAirURL` variable in `sync.sh` if different).
+- A Toshiba FlashAir Wi-Fi SD card configured with IP `192.168.1.50` (refer to "FlashAir Config.md" for configuring the Toshiba FlashAir SD card's CONFIG file, including setting the static IP, Wi-Fi mode, SSID, and password).
 - macOS or Linux system with `curl`, `bash`, and `zip` installed.
 - SleepHQ account with API credentials (optional for uploads).
 - Wi-Fi network access to both your home network and the FlashAir card.
@@ -130,4 +133,5 @@ This flow ensures automated, reliable data transfer from the SD card to SleepHQ,
 Feel free to fork, submit issues, or pull requests to improve this tool for the SleepHQ community!
 
 ### License
-[MIT License](LICENSE) (or specify your preferred license).
+[MIT License](LICENSE)
+```
