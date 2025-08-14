@@ -1,8 +1,8 @@
 # FlashAir-to-SleepHQ
 
-Originally based on the EZShare CPAP sync script by iitggithub (MIT License at https://github.com/iitggithub/ezshare_cpap), this project has been adapted and extended for Toshiba FlashAir Wi-Fi SD cards to automate syncing CPAP data to SleepHQ. Credit to the original developer for the inspiration and foundational code—our version has evolved significantly but acknowledges that heritage.
+Based initially on the EZShare CPAP sync script by iitggithub (MIT License at https://github.com/iitggithub/ezshare_cpap), this project has been adapted and extended to support Toshiba FlashAir Wi-Fi SD cards, automating the syncing of CPAP data to SleepHQ. Credit to the original developer for the inspiration and foundational code; this version has evolved significantly, yet it acknowledges that heritage.
 
-This repository contains scripts to synchronize data from a Toshiba FlashAir Wi-Fi SD card to SleepHQ, a sleep data management platform. It supports macOS and Linux, with automation via launchd on macOS. Last updated: 11:02 PM EDT, August 12, 2025.
+This repository contains scripts to synchronize data from a Toshiba FlashAir Wi-Fi SD card to SleepHQ, a sleep data management platform. It supports macOS and Linux, with automation via launchd on macOS. 
 
 ## Files
 
@@ -30,7 +30,7 @@ This flow ensures automated, reliable data transfer from the SD card to SleepHQ,
 ## Setup Instructions
 
 ### Prerequisites
-- A Toshiba FlashAir Wi-Fi SD card configured with IP `192.168.1.50` (refer to "FlashAir Config.md" for configuring the Toshiba FlashAir SD card's CONFIG file, including setting the static IP, Wi-Fi mode, SSID, and password).
+- A Toshiba FlashAir Wi-Fi SD card configured with IP `192.168.1.50` (edit the `flashAirURL` variable in `sync.sh` if different). Note: The FlashAir W-04 model requires a 2.4GHz Wi-Fi spectrum and supports WPA2 security (recommended for secure connections; it also supports WEP and WPA, but WPA2 is default).
 - macOS or Linux system with `curl`, `bash`, and `zip` installed.
 - SleepHQ account with API credentials (optional for uploads).
 - Wi-Fi network access to both your home network and the FlashAir card.
@@ -66,40 +66,9 @@ This flow ensures automated, reliable data transfer from the SD card to SleepHQ,
    - On macOS, credentials are stored in the keychain; on Linux, in `~/.flashair`.
 
 5. **Verify `poll_flashair.sh`**
-   The repo includes `poll_flashair.sh` as a wrapper. Ensure its content matches:
-   ```bash
-   #!/bin/bash
-   # Wrapper script to run sync.sh for FlashAir-to-SleepHQ automation
-   SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-   SYNC_SCRIPT="${SCRIPT_DIR}/sync.sh"
-   LOG_DIR="${SCRIPT_DIR}"
-   STARTUP_LOG="${LOG_DIR}/sync-startup-log.txt"
-   ERROR_LOG="${LOG_DIR}/sync-error-log.txt"
-   if [ ! -f "${SYNC_SCRIPT}" ]; then
-     echo "Error: sync.sh not found at ${SYNC_SCRIPT}. Please ensure it's in the same directory." >&2
-     echo "$(date '+%Y-%m-%d %H:%M:%S') - Error: sync.sh not found" >> "${ERROR_LOG}"
-     exit 1
-   fi
-   if [ ! -x "${SYNC_SCRIPT}" ]; then
-     echo "Error: sync.sh is not executable at ${SYNC_SCRIPT}. Fixing permissions..." >&2
-     chmod +x "${SYNC_SCRIPT}"
-     if [ ! -x "${SYNC_SCRIPT}" ]; then
-       echo "$(date '+%Y-%m-%d %H:%M:%S') - Error: Failed to make sync.sh executable" >> "${ERROR_LOG}"
-       exit 1
-     fi
-   fi
-   echo "$(date '+%Y-%m-%d %H:%M:%S') - Starting synchronization" >> "${STARTUP_LOG}"
-   "${SYNC_SCRIPT}" >> "${STARTUP_LOG}" 2>> "${ERROR_LOG}"
-   if [ $? -eq 0 ]; then
-     echo "$(date '+%Y-%m-%d %H:%M:%S') - Synchronization completed successfully" >> "${STARTUP_LOG}"
-   else
-     echo "$(date '+%Y-%m-%d %H:%M:%S') - Synchronization failed (see error log)" >> "${ERROR_LOG}"
-   fi
-   exit 0
-   ```
-   - This script dynamically locates and runs `sync.sh`, logging output. No changes are needed unless you want to add flags (e.g., `./sync.sh --full-sync`).
-
-6. **Set Up Launchd Automation (macOS)**
+   The repo includes `poll_flashair.sh` as a wrapper. Copy the content from [poll_flashair.sh](https://raw.githubusercontent.com/ApeWare/FlashAir-to-SleepHQ/main/poll_flashair.sh) into a new file named `poll_flashair.sh` if it's not already present, or update your existing file to match the latest version. This script dynamically locates and runs `sync.sh`, logging output. Make it executable: `chmod +x poll_flashair.sh`.
+   
+7. **Set Up Launchd Automation (macOS)**
    - Copy the `com.user.pollflashair.plist.template` to `~/Library/LaunchAgents/`:
      ```bash
      cp com.user.pollflashair.plist.template ~/Library/LaunchAgents/com.user.pollflashair.plist
@@ -114,7 +83,7 @@ This flow ensures automated, reliable data transfer from the SD card to SleepHQ,
    - Verify it’s running: `launchctl list | grep pollflashair`.
    - (Optional) Start immediately: `launchctl start com.user.pollflashair` or reboot to test on login.
 
-7. **Test the Setup**
+8. **Test the Setup**
    - Ensure your FlashAir card is inserted and Wi-Fi is active.
    - Run `./sync.sh` manually to test. Check for errors in the terminal or `sync-error-log.txt`.
    - If using launchd, wait for the next interval (default 1 hour) or force a run with `launchctl start com.user.pollflashair`.
