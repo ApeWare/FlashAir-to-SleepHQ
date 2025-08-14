@@ -18,7 +18,7 @@ This repository contains scripts to synchronize data from a Toshiba FlashAir Wi-
 ### Flowchart and Description
 The synchronization process involves multiple components working together. Below is a flowchart illustrating the workflow:
 
-![FlashAir-to-SleepHQ Flowchart](flowchart.png)
+![FlashAir-to-SleepHQ Flowchart](flowchart-dark.png)
 
 ### Flowchart Description
 
