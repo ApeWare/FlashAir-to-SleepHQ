@@ -33,7 +33,15 @@ The synchronization process involves multiple components working together. Below
 ## FlashAir Setup
 1. Connect to FlashAir WiFi (default SSID: flashair_XXXXXXXX, PW: 12345678).
 2. Browse http://192.168.0.1/config.cgi.
-3. Edit /SD_WLAN/CONFIG: APPMODE=5, APPSSID=your_SSID (e.g., "Playa de Perez"), APPNETWORKKEY=your_PW, CIP=192.168.1.50, APPINFO=SD, APPNAME=FLASH AIR.
+3. Edit /SD_WLAN/CONFIG:
+   ```
+   APPMODE=5,
+   APPSSID=your_SSID (e.g., "MyWifi"),
+   APPNETWORKKEY=your_PW,
+   CIP=192.168.1.50,
+   APPINFO=SD,
+   APPNAME=FLASH AIR.
+   ```
 4. Save, reboot. Test: Ping 192.168.1.50 on local WiFi.
 
 ## Setup Instructions
