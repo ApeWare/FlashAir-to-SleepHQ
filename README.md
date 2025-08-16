@@ -1,6 +1,6 @@
 # FlashAir-to-SleepHQ
 
-Based initially on the EZShare CPAP sync script by iitggithub (MIT License at https://github.com/iitggithub/ezshare_cpap), this project has been adapted and extended to support Toshiba FlashAir Wi-Fi SD cards, automating the syncing of CPAP data to SleepHQ. Credit to the original developer for the inspiration and foundational code; this version has evolved significantly, yet it acknowledges that heritage.
+Based initially on the EZShare CPAP sync script by [iitggithub](https://github.com/iitggithub) (MIT License at https://github.com/iitggithub/ezshare_cpap), this project has been adapted and extended to support Toshiba FlashAir Wi-Fi SD cards, automating the syncing of CPAP data to SleepHQ. Credit to the original developer for the inspiration and foundational code; this version has evolved significantly, yet it acknowledges that heritage.
 
 This repository contains scripts to synchronize data from a Toshiba FlashAir Wi-Fi SD card to SleepHQ, a sleep data management platform. It supports macOS and Linux, with automation via launchd on macOS. 
 
