@@ -125,4 +125,3 @@ Feel free to fork, submit issues, or pull requests to improve this tool for the 
 
 ### License
 [MIT License](LICENSE)
-```
