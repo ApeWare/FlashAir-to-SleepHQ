@@ -30,6 +30,12 @@ The synchronization process involves multiple components working together. Below
 | **FlashAir SD Card** | The data source, providing sleep data (e.g., DATALOG files) accessed by `sync.sh`. |
 | **User Interaction** | Users configure Wi-Fi credentials and optional SleepHQ API details interactively the first time, with command-line flags (e.g., `--skip-sync`) for control.
 
+## FlashAir Setup
+1. Connect to FlashAir WiFi (default SSID: flashair_XXXXXXXX, PW: 12345678).
+2. Browse http://192.168.0.1/config.cgi.
+3. Edit /SD_WLAN/CONFIG: APPMODE=5, APPSSID=your_SSID (e.g., "Playa de Perez"), APPNETWORKKEY=your_PW, CIP=192.168.1.50, APPINFO=SD, APPNAME=FLASH AIR.
+4. Save, reboot. Test: Ping 192.168.1.50 on local WiFi.
+
 ## Setup Instructions
 
 ### Prerequisites
@@ -100,6 +106,11 @@ The synchronization process involves multiple components working together. Below
 - **Connectivity Issues**: Ensure the FlashAir IP matches `flashAirURL`. Check Wi-Fi credentials.
 - **Log Files**: Review `sync-startup-log.txt` and `sync-error-log.txt` for details.
 - **Permission Warning**: macOS may flag "unidentified developer" in Login Items. Right-click `poll_flashair.sh` > Open to approve, or ad-hoc sign with `codesign --force --sign - poll_flashair.sh` (local use only; warning may persist for distribution).
+- **Poll Timestamp 0/1969**: FlashAir API bug—edit poll_flashair.sh to parse folder name: `folder_time=$(date -j -f "%Y%m%d" "${name}" "+%s" 2>/dev/null || echo 0)`
+- **No Detection**: Ensure 10 files in DATALOG/YYYYMMDD (5 .edf + 5 .crc with prefixes). Check debug output.
+- **Upload Fails**: Verify credentials; add retries to API calls in sync.sh.
+- **WiFi Issues**: Uncomment connection logic in sync.sh.
+- Run shellcheck: `shellcheck *.sh` for linting.
 
 ### Contributing
 Feel free to fork, submit issues, or pull requests to improve this tool for the SleepHQ community!
